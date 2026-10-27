@@ -1,0 +1,41 @@
+# ---- Data -------------------------------------------------------------
+# Event logs are large and reproducible from public sources; keep them local.
+dataset/
+*.xes
+
+# ---- Experiment output ------------------------------------------------
+results/
+tuning/
+work/
+*.log
+
+# ---- Legacy / archived material (kept on disk, not versioned) ---------
+# Original FHGSN implementation, slide deck, history notes, IDE settings.
+_archive/
+IJCNN.py
+*.pptx
+~$*.pptx
+
+# ---- Python -----------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# ---- Environments -----------------------------------------------------
+.venv*/
+_venv*/
+venv/
+env/
+.pydeps/
+*.weights.h5
+
+# ---- OS / editor ------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
