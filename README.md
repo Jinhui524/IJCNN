@@ -2,15 +2,6 @@
 
 Change-aware next-activity prediction over sparse causal history graphs.
 
-Each event in a process prefix is a node carrying its activity, categorical
-attributes, quantile-binned and continuous timing, and a sinusoidal position.
-Edges connect an event to a fixed window of its predecessors. An edge encodes
-the *change* between its endpoints: activity pair, elapsed gap in log time,
-attribute equality and missingness flips, numeric differences, and a Hawkes
-excitation intensity. A gated edge-conditioned attention layer consumes those
-descriptors; a Hawkes prior over candidate activities is added to the class
-logits before the softmax.
-
 ## Repository layout
 
 ```
