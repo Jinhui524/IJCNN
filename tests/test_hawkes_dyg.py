@@ -62,13 +62,14 @@ def setup_data():
     return frame, encoder, PrefixDataset(encoder.transform_cases(frame))
 
 
-def small_model(encoder):
+def small_model(encoder, ablate_edge_features=False):
     return HawkesDYGNN(encoder.num_activities, encoder.attribute_vocab_sizes,
                       encoder.duration_bin_count, encoder.elapsed_bin_count,
                       embedding_dim=5, hidden_dim=9, graph_layers=2, dropout=0.0,
                       history_window=4, attribute_names=encoder.attribute_cols,
                       numeric_attribute_names=[name for name in encoder.attribute_cols
                                                if name in encoder.config.numeric_attribute_cols],
+                      ablate_edge_features=ablate_edge_features,
                       model_version=HawkesDYGNN.MODEL_VERSION)
 
 
@@ -292,6 +293,70 @@ class ModelTests(unittest.TestCase):
         # The candidate intensity head gives every observed source activity a
         # differentiable score for every candidate destination activity.
         self.assertTrue(torch.isfinite(model.influence.theta_alpha).all())
+
+    def test_edge_feature_ablation_keeps_shapes_and_zeroes_descriptors(self):
+        """The ablation must remove information without changing capacity.
+
+        Zeroing the descriptors instead of shrinking the tensor keeps every
+        parameter shape identical, so a result difference is attributable to the
+        information and not to a smaller model.
+        """
+
+        _, encoder, ds = setup_data()
+        batch = collate_prefix_batch([ds[2]])
+        full = small_model(encoder).eval()
+        ablated = small_model(encoder, ablate_edge_features=True).eval()
+        ablated.load_state_dict(full.state_dict())
+        self.assertEqual(
+            sum(p.numel() for p in full.parameters()),
+            sum(p.numel() for p in ablated.parameters()),
+        )
+        with torch.no_grad():
+            self.assertFalse(torch.allclose(full(**inputs(batch)), ablated(**inputs(batch))))
+            layer = ablated.graph_layers[0]
+            elapsed = batch["elapsed"]
+            sources = layer._slot_positions(
+                elapsed.size(1), ablated.history_window, elapsed.device
+            )
+            static = layer._static_edge_features(
+                elapsed,
+                torch.ones(elapsed.size(0), elapsed.size(1), ablated.history_window, 1),
+                batch["attributes"],
+                batch["numeric_attributes"],
+                batch["attribute_missing"],
+                sources,
+                elapsed.size(1),
+                ablated.history_window,
+            )
+            self.assertTrue(torch.equal(static, torch.zeros_like(static)))
+
+    def test_zero_graph_layers_falls_back_to_readout_only(self):
+        """``graph_layers=0`` is the no-message-passing ablation.
+
+        Nodes keep their encoder output; ``last``, ``mean`` and ``last_delta``
+        still reach the classifier, and the auxiliary diagnostics must not try
+        to stack over an empty layer list.
+        """
+
+        _, encoder, ds = setup_data()
+        model = HawkesDYGNN(
+            encoder.num_activities, encoder.attribute_vocab_sizes,
+            encoder.duration_bin_count, encoder.elapsed_bin_count,
+            embedding_dim=5, hidden_dim=9, graph_layers=0, dropout=0.0,
+            history_window=4, attribute_names=encoder.attribute_cols,
+            model_version=HawkesDYGNN.MODEL_VERSION,
+        ).eval()
+        self.assertEqual(len(model.graph_layers), 0)
+        batch = collate_prefix_batch([ds[2]])
+        logits, aux = model(**inputs(batch), return_aux=True)
+        self.assertEqual(logits.shape, (1, encoder.num_activities))
+        self.assertTrue(torch.isfinite(logits).all())
+        self.assertEqual(aux["omega_scale"].numel(), 0)
+        self.assertEqual(float(aux["attention_entropy"]), 0.0)
+        # Removing propagation must change the prediction path, not break it.
+        dense = small_model(encoder).eval()
+        with torch.no_grad():
+            self.assertFalse(torch.allclose(dense(**inputs(batch)), logits))
 
     def test_sparse_history_window_and_causal_edges(self):
         _, encoder, ds = setup_data()

@@ -488,9 +488,12 @@ def _build_loader(dataset, batch_size, shuffle, workers, pin_memory=False):
 
 
 def validate_experiment(config, max_cases=None, max_prefixes=None):
-    for name in ["epochs", "batch_size", "patience", "graph_layers", "hidden_dim", "embedding_dim", "cpu_threads", "history_window"]:
+    for name in ["epochs", "batch_size", "patience", "hidden_dim", "embedding_dim", "cpu_threads", "history_window"]:
         if getattr(config, name) < 1:
             raise ValueError(f"{name} must be positive")
+    # Zero layers is the no-message-passing ablation and is allowed.
+    if config.graph_layers < 0:
+        raise ValueError("graph_layers must be non-negative")
     if config.folds < 2 or config.time_bins < 2 or config.min_prefix_len < 1:
         raise ValueError("folds/time_bins must be >= 2 and min_prefix_len >= 1")
     if not 0 < config.validation_ratio < 1 or not 0 <= config.dropout < 1:
@@ -593,6 +596,7 @@ def run_dataset(dataset_name, experiment=None, device_name="auto", max_cases=Non
                             "omega_scale_init": config.omega_scale_init,
                             "omega_scale_max": config.omega_scale_max,
                             "time_scale": float(encoder.time_scale),
+                            "ablate_edge_features": config.ablate_edge_features,
                             "model_version": HawkesDYGNN.MODEL_VERSION}
             # Keep compatibility with checkpoints produced by model versions
             # that do not yet expose the bounded-prior constructor arguments.
@@ -664,6 +668,9 @@ def build_argument_parser(default_dataset=None):
                         default=defaults.selection_metric)
     parser.add_argument("--skip-test", action="store_true", default=defaults.skip_test,
                         help="Train and report validation metrics without evaluating the test split")
+    parser.add_argument("--ablate-edge-features", action="store_true",
+                        default=defaults.ablate_edge_features,
+                        help="Zero the hand-crafted edge change descriptors (ablation)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING"])
     return parser
 

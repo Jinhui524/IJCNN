@@ -58,6 +58,13 @@ class ExperimentConfig:
     intensity_scale_max: float = 1.0
     omega_scale_init: float = 0.1
     omega_scale_max: float = 1.0
+    # Ablation: feed zeros into the hand-crafted change descriptors (elapsed
+    # gap, log gap, log alpha, attribute same/missing flags, numeric diffs)
+    # while keeping the tensor width identical.  Parameter count is unchanged,
+    # so the comparison isolates the information content of those descriptors
+    # rather than the model's capacity.  ``target - source`` hidden states and
+    # the activity-pair view are deliberately kept.
+    ablate_edge_features: bool = False
     skip_test: bool = False
     num_workers: int = 0
     cpu_threads: int = 4

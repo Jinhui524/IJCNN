@@ -289,6 +289,7 @@ class HawkesGatedDirectedGraphConv(nn.Module):
         pair_dim: int = 16,
         lag_dim: int = 8,
         time_scale: float = 1.0,
+        ablate_edge_features: bool = False,
     ) -> None:
         super().__init__()
         if history_window < 1:
@@ -328,6 +329,11 @@ class HawkesGatedDirectedGraphConv(nn.Module):
         static_dim = 3 + 2 * len(self.attribute_names) + 2 * len(
             self.numeric_attribute_names
         )
+        self.static_dim = static_dim
+        # Ablation switch.  Zeroing the descriptors keeps ``edge_input_dim`` and
+        # therefore every parameter shape unchanged, so a difference in results
+        # is attributable to the information, not to the model's capacity.
+        self.ablate_edge_features = bool(ablate_edge_features)
         edge_input_dim = 3 * hidden_dim + pair_dim + lag_dim + static_dim
         self.edge_encoder = nn.Sequential(
             nn.Linear(edge_input_dim, hidden_dim),
@@ -474,6 +480,14 @@ class HawkesGatedDirectedGraphConv(nn.Module):
 
         source_elapsed = self._gather_slots(elapsed, sources, sequence_length, window)
         gap = (elapsed.unsqueeze(2) - source_elapsed).clamp_min(0.0)
+        if self.ablate_edge_features:
+            # Ablation: every hand-crafted change descriptor is removed at once
+            # while the tensor keeps its width, so the encoder's parameters are
+            # untouched.  What remains on the edge is ``source_hidden``,
+            # ``target_hidden``, ``target - source``, the activity-pair view and
+            # the lag embedding -- i.e. change information the network must
+            # derive itself rather than being handed.
+            return gap.new_zeros((*gap.shape, self.static_dim))
         # Same log time scale as the Hawkes kernel, so the descriptor exposes the
         # exact quantity delta_ji that the prior is computed from.  ``elapsed``
         # is already in units of ``time_scale`` (see ``HawkesTemporalInfluence.
@@ -642,6 +656,7 @@ class HawkesDYGNN(nn.Module):
         omega_scale_init: float = 0.1,
         omega_scale_max: float = 1.0,
         time_scale: float = 1.0,
+        ablate_edge_features: bool = False,
         model_version: Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -652,8 +667,12 @@ class HawkesDYGNN(nn.Module):
             )
         self.num_activities = num_activities
         self.history_window = int(history_window)
-        if graph_layers < 1:
-            raise ValueError("graph_layers must be at least one")
+        # ``graph_layers == 0`` is the no-message-passing ablation: nodes keep
+        # their encoder output and only the readout (last / mean / last-delta)
+        # and the candidate prior remain.  It answers "does any inter-event
+        # propagation help", which no window setting can.
+        if graph_layers < 0:
+            raise ValueError("graph_layers must be non-negative")
         if self.history_window < 1:
             raise ValueError("history_window must be at least one")
         resolved_attribute_names = list(attribute_names or attribute_vocab_sizes.keys())
@@ -687,6 +706,7 @@ class HawkesDYGNN(nn.Module):
                     history_window=self.history_window,
                     dropout=dropout,
                     time_scale=time_scale,
+                    ablate_edge_features=ablate_edge_features,
                 )
                 for _ in range(graph_layers)
             ]
@@ -779,12 +799,22 @@ class HawkesDYGNN(nn.Module):
         logits = logits + intensity_scale * normalized_log_intensity
         if return_aux:
             alpha, _, _ = self.influence.positive_parameters()
-            attention_entropy = torch.stack(
-                [layer.last_attention_entropy for layer in self.graph_layers]
-            ).mean()
-            seq_gate_mean = torch.stack(
-                [layer.last_seq_gate_mean for layer in self.graph_layers]
-            ).mean()
+            if self.graph_layers:
+                attention_entropy = torch.stack(
+                    [layer.last_attention_entropy for layer in self.graph_layers]
+                ).mean()
+                seq_gate_mean = torch.stack(
+                    [layer.last_seq_gate_mean for layer in self.graph_layers]
+                ).mean()
+                omega_scale = torch.stack(
+                    [layer.omega_scale_value() for layer in self.graph_layers]
+                )
+            else:
+                # No graph layer means no attention to describe; report zeros
+                # so the diagnostics schema stays identical across ablations.
+                attention_entropy = hidden.new_zeros(())
+                seq_gate_mean = hidden.new_zeros(())
+                omega_scale = hidden.new_zeros(0)
             return logits, {
                 "omega": omega,
                 "edge_mask": edge_mask,
@@ -794,9 +824,7 @@ class HawkesDYGNN(nn.Module):
                 "intensity": intensity,
                 "intensity_scale": intensity_scale,
                 "normalized_log_intensity": normalized_log_intensity,
-                "omega_scale": torch.stack(
-                    [layer.omega_scale_value() for layer in self.graph_layers]
-                ),
+                "omega_scale": omega_scale,
                 "attention_entropy": attention_entropy,
                 "seq_gate_mean": seq_gate_mean,
             }
