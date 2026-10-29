@@ -58,10 +58,6 @@ class ExperimentConfig:
     intensity_scale_max: float = 1.0
     omega_scale_init: float = 0.1
     omega_scale_max: float = 1.0
-    # Weight of the auxiliary head that predicts the prefix's last log gap from
-    # the final change vector.  Zero disables it, which is the ablation switch
-    # for the "change is supervised" claim.
-    change_loss_weight: float = 0.1
     skip_test: bool = False
     num_workers: int = 0
     cpu_threads: int = 4

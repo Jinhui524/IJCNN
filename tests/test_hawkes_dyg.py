@@ -23,7 +23,6 @@ from hawkes_dyg.model import (
 )
 from hawkes_dyg.runner import (
     _metric_dict,
-    _training_loss,
     evaluate,
     load_trained_fold,
     macro_gmean,
@@ -362,43 +361,6 @@ class ModelTests(unittest.TestCase):
         for layer in model.graph_layers:
             self.assertFalse(hasattr(layer, "pair_embedding"))
             self.assertTrue(hasattr(layer, "pair_projection"))
-
-    def test_change_head_is_supervised_by_last_gap(self):
-        """The auxiliary head predicts the prefix's own last log gap."""
-
-        _, encoder, ds = setup_data()
-        model = small_model(encoder).train()
-        batch = collate_prefix_batch([ds[2]])
-        _, aux = model(**inputs(batch), return_aux=True)
-        self.assertEqual(aux["change_prediction"].shape, (1,))
-        self.assertEqual(aux["change_target"].shape, (1,))
-        # The target is the final event's own delta, inside the prefix.
-        expected = batch["delta"][0, int(batch["lengths"][0]) - 1]
-        self.assertAlmostEqual(float(aux["change_target"][0]), float(expected), places=5)
-        # Gradients must reach the head.
-        model.zero_grad()
-        loss = torch.nn.functional.smooth_l1_loss(
-            aux["change_prediction"], aux["change_target"]
-        )
-        loss.backward()
-        self.assertIsNotNone(model.change_head.weight.grad)
-        self.assertGreater(model.change_head.weight.grad.abs().sum().item(), 0.0)
-
-    def test_training_loss_includes_change_term(self):
-        """``change_loss_weight`` must change the loss and zero must disable it."""
-
-        _, encoder, ds = setup_data()
-        model = small_model(encoder)
-        batch = collate_prefix_batch([ds[2]])
-        criterion = torch.nn.CrossEntropyLoss()
-        with torch.no_grad():
-            plain = _training_loss(model, batch, criterion, 0.0)
-            weighted = _training_loss(model, batch, criterion, 0.5)
-        self.assertNotAlmostEqual(float(plain), float(weighted), places=6)
-        # Weight zero reproduces plain cross-entropy exactly.
-        with torch.no_grad():
-            reference = criterion(model(**inputs(batch)), batch["labels"])
-        self.assertAlmostEqual(float(plain), float(reference), places=5)
 
     def test_intensity_prior_is_normalized_and_bounded(self):
         _, encoder, ds = setup_data()

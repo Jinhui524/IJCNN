@@ -619,7 +619,7 @@ class HawkesGatedDirectedGraphConv(nn.Module):
 class HawkesDYGNN(nn.Module):
     """Next-activity predictor over sparse causal history graphs."""
 
-    MODEL_VERSION = "causal_history_v5"
+    MODEL_VERSION = "causal_history_v6"
 
     def __init__(
         self,
@@ -713,14 +713,6 @@ class HawkesDYGNN(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim * 3, num_activities),
         )
-        # Auxiliary regression on the final change vector.  ``last_delta`` is
-        # the only readout term that carries the "change" claim, but nothing in
-        # the task loss constrains what it means: ``classifier`` may ignore it
-        # and still fit the activity distribution.  Predicting the log gap of
-        # the last transition forces it to encode temporal change, and the
-        # target is the prefix's own last interval, so no future information
-        # enters.  Trained only as an auxiliary term; inference is unchanged.
-        self.change_head = nn.Linear(hidden_dim, 1)
 
     def forward(
         self,
@@ -774,7 +766,6 @@ class HawkesDYGNN(nn.Module):
         ).unsqueeze(-1)
         graph_representation = torch.cat([last, mean, last_delta], dim=-1)
         logits = self.classifier(graph_representation)
-        change_prediction = self.change_head(last_delta).squeeze(-1)
         intensity, beta, mu = self.influence.candidate_intensity(
             activity, elapsed, lengths, node_mask
         )
@@ -808,10 +799,6 @@ class HawkesDYGNN(nn.Module):
                 ),
                 "attention_entropy": attention_entropy,
                 "seq_gate_mean": seq_gate_mean,
-                "change_prediction": change_prediction,
-                # The target of the auxiliary head: the log gap that produced
-                # the last event of the prefix, already inside the prefix.
-                "change_target": delta[batch_index, last_index].to(change_prediction.dtype),
             }
         return logits
 

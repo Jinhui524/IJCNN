@@ -356,24 +356,6 @@ def _influence_statistics(model, attention_entropy=None):
     return stats
 
 
-def _training_loss(model, batch, criterion, change_weight):
-    """Cross-entropy on the next activity plus the change auxiliary term.
-
-    The auxiliary head regresses the log gap of the prefix's last transition
-    from ``last_delta``.  It is readout-only supervision: the evaluation path
-    keeps plain cross-entropy, so reported NLL stays comparable to every run
-    that predates the head.  ``change_weight == 0`` reproduces the old loss.
-    """
-
-    logits, aux = _forward(model, batch, return_aux=True)
-    loss = criterion(logits, batch["labels"])
-    if change_weight > 0 and "change_prediction" in aux:
-        loss = loss + change_weight * F.smooth_l1_loss(
-            aux["change_prediction"], aux["change_target"]
-        )
-    return loss
-
-
 def train_fold(train_loader, validation_loader, test_loader, model, config, fold_dir, device):
     optimizer = make_optimizer(model, config)
     criterion = nn.CrossEntropyLoss()
@@ -390,7 +372,7 @@ def train_fold(train_loader, validation_loader, test_loader, model, config, fold
             for raw_batch in progress:
                 batch = _move_batch(raw_batch, device)
                 optimizer.zero_grad(set_to_none=True)
-                loss = _training_loss(model, batch, criterion, config.change_loss_weight)
+                loss = criterion(_forward(model, batch), batch["labels"])
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite training loss")
                 loss.backward()
@@ -675,7 +657,6 @@ def build_argument_parser(default_dataset=None):
         ("intensity-scale-max", float, defaults.intensity_scale_max),
         ("omega-scale-init", float, defaults.omega_scale_init),
         ("omega-scale-max", float, defaults.omega_scale_max),
-        ("change-loss-weight", float, defaults.change_loss_weight),
         ("max-cases", int, None), ("max-prefixes", int, None),
     ]:
         parser.add_argument("--" + flag, type=kind, default=value)
