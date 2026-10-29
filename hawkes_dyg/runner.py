@@ -597,6 +597,7 @@ def run_dataset(dataset_name, experiment=None, device_name="auto", max_cases=Non
                             "omega_scale_max": config.omega_scale_max,
                             "time_scale": float(encoder.time_scale),
                             "ablate_edge_features": config.ablate_edge_features,
+                            "ablate_time": config.ablate_time,
                             "model_version": HawkesDYGNN.MODEL_VERSION}
             # Keep compatibility with checkpoints produced by model versions
             # that do not yet expose the bounded-prior constructor arguments.
@@ -671,6 +672,9 @@ def build_argument_parser(default_dataset=None):
     parser.add_argument("--ablate-edge-features", action="store_true",
                         default=defaults.ablate_edge_features,
                         help="Zero the hand-crafted edge change descriptors (ablation)")
+    parser.add_argument("--ablate-time", action="store_true",
+                        default=defaults.ablate_time,
+                        help="Remove every temporal signal, keeping all parameters (ablation)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING"])
     return parser
 

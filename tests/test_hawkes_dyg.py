@@ -62,7 +62,7 @@ def setup_data():
     return frame, encoder, PrefixDataset(encoder.transform_cases(frame))
 
 
-def small_model(encoder, ablate_edge_features=False):
+def small_model(encoder, ablate_edge_features=False, ablate_time=False):
     return HawkesDYGNN(encoder.num_activities, encoder.attribute_vocab_sizes,
                       encoder.duration_bin_count, encoder.elapsed_bin_count,
                       embedding_dim=5, hidden_dim=9, graph_layers=2, dropout=0.0,
@@ -70,6 +70,7 @@ def small_model(encoder, ablate_edge_features=False):
                       numeric_attribute_names=[name for name in encoder.attribute_cols
                                                if name in encoder.config.numeric_attribute_cols],
                       ablate_edge_features=ablate_edge_features,
+                      ablate_time=ablate_time,
                       model_version=HawkesDYGNN.MODEL_VERSION)
 
 
@@ -329,6 +330,37 @@ class ModelTests(unittest.TestCase):
                 ablated.history_window,
             )
             self.assertTrue(torch.equal(static, torch.zeros_like(static)))
+
+    def test_time_ablation_ignores_every_temporal_input(self):
+        """With ``ablate_time`` the prediction must not depend on timing at all.
+
+        Every temporal consumer (binned embeddings, continuous channels, Hawkes
+        gaps, edge descriptors) reads one of the four tensors neutralized in
+        ``forward``.  Perturbing any of them must therefore leave the logits
+        bit-identical, while the full model must react.
+        """
+
+        _, encoder, ds = setup_data()
+        batch = collate_prefix_batch([ds[2]])
+        ablated = small_model(encoder, ablate_time=True).eval()
+        full = small_model(encoder).eval()
+        with torch.no_grad():
+            base = ablated(**inputs(batch))
+            # Same parameters, but timing destroyed in the batch.
+            shifted = dict(inputs(batch))
+            shifted["elapsed"] = batch["elapsed"] + 7.5
+            shifted["delta"] = batch["delta"] + 2.0
+            shifted["duration_bin"] = (batch["duration_bin"] + 1) % encoder.duration_bin_count
+            shifted["elapsed_bin"] = (batch["elapsed_bin"] + 1) % encoder.elapsed_bin_count
+            torch.testing.assert_close(base, ablated(**shifted), atol=1e-6, rtol=1e-5)
+            # The same perturbation must move the unablated model, otherwise the
+            # test would pass even if time never reached the network.
+            self.assertFalse(torch.allclose(full(**inputs(batch)), full(**shifted)))
+        # Parameter count is unchanged by the ablation.
+        self.assertEqual(
+            sum(p.numel() for p in full.parameters()),
+            sum(p.numel() for p in ablated.parameters()),
+        )
 
     def test_zero_graph_layers_falls_back_to_readout_only(self):
         """``graph_layers=0`` is the no-message-passing ablation.

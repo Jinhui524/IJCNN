@@ -657,6 +657,7 @@ class HawkesDYGNN(nn.Module):
         omega_scale_max: float = 1.0,
         time_scale: float = 1.0,
         ablate_edge_features: bool = False,
+        ablate_time: bool = False,
         model_version: Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -667,6 +668,12 @@ class HawkesDYGNN(nn.Module):
             )
         self.num_activities = num_activities
         self.history_window = int(history_window)
+        # Time ablation.  Every temporal signal is fed as a constant at the
+        # single entry point of ``forward`` instead of deleting modules, so all
+        # parameters and tensor widths survive and a difference in results
+        # cannot be explained by a smaller model.  Positional encoding is not
+        # touched: it encodes event order, not event timing.
+        self.ablate_time = bool(ablate_time)
         # ``graph_layers == 0`` is the no-message-passing ablation: nodes keep
         # their encoder output and only the readout (last / mean / last-delta)
         # and the candidate prior remain.  It answers "does any inter-event
@@ -748,6 +755,22 @@ class HawkesDYGNN(nn.Module):
         attribute_missing: Mapping[str, torch.Tensor],
         return_aux: bool = False,
     ):
+        if self.ablate_time:
+            # Single choke point for the time ablation.  Every temporal consumer
+            # downstream reads one of these four tensors: the node encoder
+            # (binned embeddings + continuous channels), the Hawkes kernel and
+            # candidate intensity (gaps from ``elapsed``), and the edge
+            # descriptors (``gap`` / ``log_gap``).  Feeding constants here
+            # neutralizes all of them at once:
+            #   * gap = 0        -> kernel = exp(-beta * 0) = 1, no decay
+            #   * omega = alpha  -> the prior becomes a transition matrix
+            #   * intensity      -> mu + sum of alphas, i.e. a visit-count prior
+            # Binned ids go to 0, whose embeddings are still learned but
+            # identical across events, so they act as a per-channel bias.
+            zero_bins = torch.zeros_like(duration_bin)
+            duration_bin, elapsed_bin = zero_bins, zero_bins
+            delta = torch.zeros_like(delta)
+            elapsed = torch.zeros_like(elapsed)
         hidden = self.node_encoder(
             activity,
             attributes,

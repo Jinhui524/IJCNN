@@ -65,6 +65,13 @@ class ExperimentConfig:
     # rather than the model's capacity.  ``target - source`` hidden states and
     # the activity-pair view are deliberately kept.
     ablate_edge_features: bool = False
+    # Ablation: remove every temporal signal while keeping all parameters and
+    # tensor shapes.  Binned time embeddings and the continuous-time projection
+    # receive constant input, the Hawkes decay becomes constant (no temporal
+    # kernel), and the gap / log-gap edge descriptors are zeroed.  Positional
+    # encoding is deliberately kept: it encodes event order, not event timing,
+    # and removing it would confound "no time" with "no order".
+    ablate_time: bool = False
     skip_test: bool = False
     num_workers: int = 0
     cpu_threads: int = 4
