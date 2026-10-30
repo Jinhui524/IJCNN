@@ -290,6 +290,7 @@ class HawkesGatedDirectedGraphConv(nn.Module):
         lag_dim: int = 8,
         time_scale: float = 1.0,
         ablate_edge_features: bool = False,
+        ablate_edge_change: bool = False,
     ) -> None:
         super().__init__()
         if history_window < 1:
@@ -330,10 +331,19 @@ class HawkesGatedDirectedGraphConv(nn.Module):
             self.numeric_attribute_names
         )
         self.static_dim = static_dim
-        # Ablation switch.  Zeroing the descriptors keeps ``edge_input_dim`` and
-        # therefore every parameter shape unchanged, so a difference in results
-        # is attributable to the information, not to the model's capacity.
-        self.ablate_edge_features = bool(ablate_edge_features)
+        # Two ablation levels, both shape-preserving:
+        #   ``ablate_edge_features`` zeroes only the hand-crafted descriptors
+        #     (gap, log gap, log alpha, attribute equality/missingness, numeric
+        #     diffs).  The hidden-state difference, the activity-pair view and
+        #     the Hawkes attention bias still carry change information.
+        #   ``ablate_edge_change`` removes *all* change information from the
+        #     edge: the descriptors, ``target - source``, the pair view and the
+        #     Hawkes bias.  What remains is source/target identity and the lag
+        #     embedding, i.e. "who looks at whom, how far apart" with no notion
+        #     of what changed between them.  The lag is structural distance, not
+        #     change, so it is kept.
+        self.ablate_edge_change = bool(ablate_edge_change)
+        self.ablate_edge_features = bool(ablate_edge_features) or self.ablate_edge_change
         edge_input_dim = 3 * hidden_dim + pair_dim + lag_dim + static_dim
         self.edge_encoder = nn.Sequential(
             nn.Linear(edge_input_dim, hidden_dim),
@@ -566,11 +576,19 @@ class HawkesGatedDirectedGraphConv(nn.Module):
             sequence_length,
             window,
         )
+        hidden_difference = target_hidden - source_hidden
+        if self.ablate_edge_change:
+            # Full change ablation: the edge keeps only who the endpoints are and
+            # how far apart they sit.  Every statistic describing *what changed*
+            # between them is zeroed at its tensor's own width, so no parameter
+            # shape moves.  ``static`` is already zero via the flag above.
+            hidden_difference = torch.zeros_like(hidden_difference)
+            pair = torch.zeros_like(pair)
         edge_input = torch.cat(
             [
                 source_hidden,
                 target_hidden,
-                target_hidden - source_hidden,
+                hidden_difference,
                 pair,
                 lag_emb,
                 static,
@@ -585,8 +603,13 @@ class HawkesGatedDirectedGraphConv(nn.Module):
             (query * self.key_projection(source_hidden)).sum(dim=-1)
             / math.sqrt(self.hidden_dim)
             + self.edge_score(edge_repr).squeeze(-1)
-            + self.omega_scale_value() * torch.log1p(omega)
         )
+        if not self.ablate_edge_change:
+            # The Hawkes bias is itself a change signal: omega = alpha * decay(gap)
+            # depends on the elapsed time between the endpoints.  Dropping it is
+            # part of the full ablation; ``omega_scale`` then receives no gradient
+            # and its reported value is meaningless.
+            score = score + self.omega_scale_value() * torch.log1p(omega)
         values = self.value_projection(source_hidden) + self.edge_value_projection(
             edge_repr
         )
@@ -657,6 +680,7 @@ class HawkesDYGNN(nn.Module):
         omega_scale_max: float = 1.0,
         time_scale: float = 1.0,
         ablate_edge_features: bool = False,
+        ablate_edge_change: bool = False,
         ablate_time: bool = False,
         model_version: Optional[str] = None,
     ) -> None:
@@ -714,6 +738,7 @@ class HawkesDYGNN(nn.Module):
                     dropout=dropout,
                     time_scale=time_scale,
                     ablate_edge_features=ablate_edge_features,
+                    ablate_edge_change=ablate_edge_change,
                 )
                 for _ in range(graph_layers)
             ]

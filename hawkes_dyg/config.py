@@ -65,6 +65,13 @@ class ExperimentConfig:
     # rather than the model's capacity.  ``target - source`` hidden states and
     # the activity-pair view are deliberately kept.
     ablate_edge_features: bool = False
+    # Ablation: remove every change signal from the edge.  Superset of
+    # ``ablate_edge_features`` -- also zeroes ``target - source`` and the
+    # activity-pair view, and drops the Hawkes attention bias (whose decay
+    # depends on the endpoint gap).  Source/target identity and the lag
+    # embedding survive, so the edge still says who looks at whom and how far
+    # apart, but nothing about what changed between them.
+    ablate_edge_change: bool = False
     # Ablation: remove every temporal signal while keeping all parameters and
     # tensor shapes.  Binned time embeddings and the continuous-time projection
     # receive constant input, the Hawkes decay becomes constant (no temporal

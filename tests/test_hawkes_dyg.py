@@ -62,7 +62,8 @@ def setup_data():
     return frame, encoder, PrefixDataset(encoder.transform_cases(frame))
 
 
-def small_model(encoder, ablate_edge_features=False, ablate_time=False):
+def small_model(encoder, ablate_edge_features=False, ablate_time=False,
+                ablate_edge_change=False):
     return HawkesDYGNN(encoder.num_activities, encoder.attribute_vocab_sizes,
                       encoder.duration_bin_count, encoder.elapsed_bin_count,
                       embedding_dim=5, hidden_dim=9, graph_layers=2, dropout=0.0,
@@ -70,6 +71,7 @@ def small_model(encoder, ablate_edge_features=False, ablate_time=False):
                       numeric_attribute_names=[name for name in encoder.attribute_cols
                                                if name in encoder.config.numeric_attribute_cols],
                       ablate_edge_features=ablate_edge_features,
+                      ablate_edge_change=ablate_edge_change,
                       ablate_time=ablate_time,
                       model_version=HawkesDYGNN.MODEL_VERSION)
 
@@ -330,6 +332,66 @@ class ModelTests(unittest.TestCase):
                 ablated.history_window,
             )
             self.assertTrue(torch.equal(static, torch.zeros_like(static)))
+
+    def test_edge_change_ablation_makes_edges_invariant_to_change(self):
+        """Full edge ablation: the edge keeps only identity and lag.
+
+        With every change statistic removed, the layer output must be identical
+        when the timing, the attributes and ``alpha`` are perturbed, given the
+        same node states.  Perturbing the node states themselves still changes
+        the output, which shows the layer is alive rather than degenerate.
+        """
+
+        torch.manual_seed(0)
+        layer = HawkesGatedDirectedGraphConv(
+            hidden_dim=6, num_activities=3, attribute_names=["resource"],
+            numeric_attribute_names=["amount"], history_window=3, dropout=0.0,
+            ablate_edge_change=True,
+        )
+        hidden = torch.randn(1, 4, 6)
+        activity = torch.tensor([[0, 1, 2, 0]])
+        elapsed = torch.tensor([[0.0, 1.0, 4.0, 9.0]])
+        attributes = {"resource": torch.tensor([[0, 1, 2, 1]])}
+        numeric = {"amount": torch.tensor([[0.0, 0.5, -1.0, 2.0]])}
+        missing = {"resource": torch.zeros(1, 4, dtype=torch.bool)}
+        node_mask = torch.tensor([[True, True, True, True]])
+        window = 3
+        omega = torch.rand(1, 4, window)
+        edge_mask = torch.zeros(1, 4, window, dtype=torch.bool)
+        for lag in range(1, window + 1):
+            edge_mask[:, lag:, lag - 1] = node_mask[:, :-lag] & node_mask[:, lag:]
+        alpha = torch.rand(3, 3) + 0.5
+
+        def run(h, el, attrs, num, al):
+            return layer(h, activity, el, attrs, num, missing, omega, edge_mask,
+                         node_mask, alpha=al)
+
+        with torch.no_grad():
+            baseline = run(hidden, elapsed, attributes, numeric, alpha)
+            # Timing, attributes and pair strength must not matter at all.
+            perturbed_time = run(hidden, elapsed * 3.0 + 5.0, attributes, numeric, alpha)
+            perturbed_attrs = run(
+                hidden, elapsed,
+                {"resource": torch.tensor([[2, 2, 0, 0]])},
+                {"amount": torch.tensor([[5.0, -3.0, 1.0, 8.0]])},
+                alpha,
+            )
+            perturbed_alpha = run(hidden, elapsed, attributes, numeric, alpha * 4.0)
+            torch.testing.assert_close(baseline, perturbed_time)
+            torch.testing.assert_close(baseline, perturbed_attrs)
+            torch.testing.assert_close(baseline, perturbed_alpha)
+            # The layer still responds to node states: it is not a constant map.
+            self.assertFalse(torch.allclose(baseline, run(hidden + 1.0, elapsed,
+                                                          attributes, numeric, alpha)))
+        # Parameter count is unchanged relative to the full model.
+        full = HawkesGatedDirectedGraphConv(
+            hidden_dim=6, num_activities=3, attribute_names=["resource"],
+            numeric_attribute_names=["amount"], history_window=3, dropout=0.0,
+        )
+        self.assertEqual(
+            sum(p.numel() for p in full.parameters()),
+            sum(p.numel() for p in layer.parameters()),
+        )
 
     def test_time_ablation_ignores_every_temporal_input(self):
         """With ``ablate_time`` the prediction must not depend on timing at all.
