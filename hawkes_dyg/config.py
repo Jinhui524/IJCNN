@@ -42,7 +42,7 @@ class ExperimentConfig:
     time_bins: int = 20
     embedding_dim: int = 64
     hidden_dim: int = 64
-    graph_layers: int = 2
+    graph_layers: int = 1
     history_window: int = 32
     dropout: float = 0.2
     batch_size: int = 64
