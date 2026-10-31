@@ -63,11 +63,13 @@ def setup_data():
 
 
 def small_model(encoder, ablate_edge_features=False, ablate_time=False,
-                ablate_edge_change=False):
+                ablate_edge_change=False, history_window=4, graph_layers=2):
     return HawkesDYGNN(encoder.num_activities, encoder.attribute_vocab_sizes,
                       encoder.duration_bin_count, encoder.elapsed_bin_count,
-                      embedding_dim=5, hidden_dim=9, graph_layers=2, dropout=0.0,
-                      history_window=4, attribute_names=encoder.attribute_cols,
+                      embedding_dim=5, hidden_dim=9, graph_layers=graph_layers,
+                      dropout=0.0,
+                      history_window=history_window,
+                      attribute_names=encoder.attribute_cols,
                       numeric_attribute_names=[name for name in encoder.attribute_cols
                                                if name in encoder.config.numeric_attribute_cols],
                       ablate_edge_features=ablate_edge_features,
@@ -380,6 +382,17 @@ class ModelTests(unittest.TestCase):
             torch.testing.assert_close(baseline, perturbed_time)
             torch.testing.assert_close(baseline, perturbed_attrs)
             torch.testing.assert_close(baseline, perturbed_alpha)
+            # The Hawkes bias ``omega_scale * log1p(omega)`` depends on the
+            # endpoint gap, so the same perturbation applied to ``omega`` must
+            # leave the layer untouched as well.
+            with torch.no_grad():
+                layer_omega = layer.omega_scale_value()
+                self.assertGreater(float(layer_omega), 0.0)
+                perturbed_omega = layer(
+                    hidden, activity, elapsed, attributes, numeric, missing,
+                    omega * 9.0, edge_mask, node_mask, alpha=alpha,
+                )
+            torch.testing.assert_close(baseline, perturbed_omega)
             # The layer still responds to node states: it is not a constant map.
             self.assertFalse(torch.allclose(baseline, run(hidden + 1.0, elapsed,
                                                           attributes, numeric, alpha)))
@@ -392,6 +405,78 @@ class ModelTests(unittest.TestCase):
             sum(p.numel() for p in full.parameters()),
             sum(p.numel() for p in layer.parameters()),
         )
+
+    def test_chain_ablation_keeps_only_the_direct_predecessor(self):
+        """``history_window=1`` must degenerate the graph to a chain.
+
+        With a window of one every history slot is masked out and the only
+        remaining inter-node path is the gated direct predecessor edge; the
+        layered softmax must stay finite in both directions even though its
+        masked input is empty (a fully masked row used to emit NaN gradients).
+        """
+
+        layer = HawkesGatedDirectedGraphConv(
+            hidden_dim=6, num_activities=3, attribute_names=[],
+            numeric_attribute_names=[], history_window=1, dropout=0.0,
+        )
+        hidden = torch.randn(2, 5, 6)
+        activity = torch.tensor([[0, 1, 2, 1, 0], [2, 2, 1, 0, 1]])
+        elapsed = torch.tensor([[0., 1., 3., 6., 10.],
+                                [0., 2., 2., 5., 9.]])
+        node_mask = torch.ones(2, 5, dtype=torch.bool)
+        edge_mask = torch.zeros(2, 5, 1, dtype=torch.bool)
+        edge_mask[:, 1:, 0] = True
+        omega = torch.rand(2, 5, 1)
+        alpha = torch.rand(3, 3) + 0.5
+
+        def run(h):
+            return layer(h, activity, elapsed, {}, {}, {}, omega, edge_mask,
+                         node_mask, alpha=alpha)
+
+        base = run(hidden)
+        self.assertTrue(torch.isfinite(base).all())
+        # Position i must depend on itself and i-1 only: changing position 0
+        # leaves position >= 2 untouched.
+        changed = hidden.clone()
+        changed[:, 0] += 5.0
+        torch.testing.assert_close(run(changed)[:, 2:], base[:, 2:])
+
+        loss = base.pow(2).sum()
+        loss.backward()
+        for name, parameter in layer.named_parameters():
+            if parameter.grad is not None:
+                self.assertTrue(torch.isfinite(parameter.grad).all(),
+                                msg=f"non-finite gradient in {name}")
+
+    def test_edge_change_ablation_removes_the_intensity_prior_from_logits(self):
+        """The structured transition prior must not leak into predictions.
+
+        ``candidate_intensity`` is ``mu + sum_j alpha * kernel(gap)``: it
+        encodes both pair transition strength and temporal decay, exactly the
+        information the full change ablation is meant to remove.  Reparameterising
+        ``intensity_scale`` must therefore leave the logits unchanged.
+        """
+
+        _, encoder, ds = setup_data()
+        model = small_model(encoder, ablate_edge_change=True).eval()
+        batch = inputs(collate_prefix_batch([ds[2]]))
+        with torch.no_grad():
+            base = model(**batch)
+            scale_before = float(
+                model.intensity_scale_max * torch.sigmoid(model.theta_intensity_scale)
+            )
+            model.theta_intensity_scale.add_(3.0)
+            scale_after = float(
+                model.intensity_scale_max * torch.sigmoid(model.theta_intensity_scale)
+            )
+            shifted = model(**batch)
+        self.assertGreater(abs(scale_after - scale_before), 1e-3)
+        torch.testing.assert_close(base, shifted)
+        # Aux diagnostics still report the prior even though it is detached
+        # from the prediction path.
+        with torch.no_grad():
+            _, aux = model(**batch, return_aux=True)
+        self.assertTrue(torch.isfinite(aux["intensity"]).all())
 
     def test_time_ablation_ignores_every_temporal_input(self):
         """With ``ablate_time`` the prediction must not depend on timing at all.

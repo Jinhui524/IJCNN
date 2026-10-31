@@ -336,12 +336,16 @@ class HawkesGatedDirectedGraphConv(nn.Module):
         #     (gap, log gap, log alpha, attribute equality/missingness, numeric
         #     diffs).  The hidden-state difference, the activity-pair view and
         #     the Hawkes attention bias still carry change information.
-        #   ``ablate_edge_change`` removes *all* change information from the
-        #     edge: the descriptors, ``target - source``, the pair view and the
-        #     Hawkes bias.  What remains is source/target identity and the lag
-        #     embedding, i.e. "who looks at whom, how far apart" with no notion
-        #     of what changed between them.  The lag is structural distance, not
-        #     change, so it is kept.
+        #   ``ablate_edge_change`` removes *all* explicit change information from
+        #     the edge: the descriptors, ``target - source``, the pair view, the
+        #     target hidden state and the Hawkes bias.  The target state has to
+        #     go as well because the first encoder layer is linear:
+        #     ``W_s*s + W_t*t`` and ``W_s*s + W_t*t + W_d*(t-s)`` span the same
+        #     function space, so keeping ``t`` would let the edge reconstruct
+        #     the difference it is supposed to be blind to.  What remains is the
+        #     source identity and the lag embedding, i.e. "who is looked at,
+        #     how far back" with no notion of what changed.  Lag is structural
+        #     distance, not change, so it is kept.
         self.ablate_edge_change = bool(ablate_edge_change)
         self.ablate_edge_features = bool(ablate_edge_features) or self.ablate_edge_change
         edge_input_dim = 3 * hidden_dim + pair_dim + lag_dim + static_dim
@@ -577,17 +581,30 @@ class HawkesGatedDirectedGraphConv(nn.Module):
             window,
         )
         hidden_difference = target_hidden - source_hidden
+        edge_target_hidden = target_hidden
         if self.ablate_edge_change:
-            # Full change ablation: the edge keeps only who the endpoints are and
-            # how far apart they sit.  Every statistic describing *what changed*
-            # between them is zeroed at its tensor's own width, so no parameter
-            # shape moves.  ``static`` is already zero via the flag above.
+            # Full change ablation: the edge keeps only who the source endpoint
+            # is and how far away it sits.  Every statistic describing *what
+            # changed* between the endpoints is removed at its tensor's own
+            # width, so no parameter shape moves:
+            #   * ``static`` is already zero via ``ablate_edge_features``;
+            #   * ``target - source`` is zeroed;
+            #   * the pair view is zeroed;
+            #   * the target hidden state is zeroed too, because the first
+            #     encoder layer is linear: ``W_s*s + W_t*t`` and
+            #     ``W_s*s + W_t*t + W_d*(t-s)`` span the same function space,
+            #     so keeping ``t`` would let the edge reconstruct the
+            #     difference and nullify the ablation.
+            #   * the Hawkes attention bias is dropped below.
+            # The target still acts as the query (``query_projection(hidden)``),
+            # which is the prediction question, not a property of the edge.
             hidden_difference = torch.zeros_like(hidden_difference)
+            edge_target_hidden = torch.zeros_like(target_hidden)
             pair = torch.zeros_like(pair)
         edge_input = torch.cat(
             [
                 source_hidden,
-                target_hidden,
+                edge_target_hidden,
                 hidden_difference,
                 pair,
                 lag_emb,
@@ -626,7 +643,16 @@ class HawkesGatedDirectedGraphConv(nn.Module):
         # event and padded positions.
         hist_mask = edge_mask.clone()
         hist_mask[:, :, 0] = False
-        masked_scores = score.masked_fill(~hist_mask, float("-inf"))
+        has_history = hist_mask.any(dim=-1, keepdim=True)
+        # A fully masked row (first event, padding, or ``history_window == 1``,
+        # where every slot is the direct predecessor) would make every score
+        # ``-inf``.  ``softmax`` then returns NaN, and although ``nan_to_num``
+        # hides that in the forward pass, the backward pass through the same
+        # expression returns NaN for ``score`` and poisons every parameter that
+        # feeds it.  Substituting a finite zero for the all-masked rows keeps
+        # the gradient defined; the row is zeroed out right after the softmax.
+        safe_mask = hist_mask | ~has_history
+        masked_scores = score.masked_fill(~safe_mask, float("-inf"))
         weights = torch.softmax(masked_scores, dim=-1)
         weights = torch.where(hist_mask, weights, torch.zeros_like(weights))
         weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
@@ -692,6 +718,11 @@ class HawkesDYGNN(nn.Module):
             )
         self.num_activities = num_activities
         self.history_window = int(history_window)
+        # Set when every explicit description of change is removed: the edge
+        # loses its target side, its difference, its pair view and its Hawkes
+        # bias, the readout loses ``last - previous``, and the transition-
+        # intensity prior is kept out of the logits.
+        self.ablate_edge_change = bool(ablate_edge_change)
         # Time ablation.  Every temporal signal is fed as a constant at the
         # single entry point of ``forward`` instead of deleting modules, so all
         # parameters and tensor widths survive and a difference in results
@@ -832,6 +863,10 @@ class HawkesDYGNN(nn.Module):
         mean = (hidden * mask).sum(dim=1) / lengths.clamp_min(1).to(
             hidden.dtype
         ).unsqueeze(-1)
+        if self.ablate_edge_change:
+            # ``last - previous`` is itself an explicit change statistic, so the
+            # full change ablation removes it from the readout as well.
+            last_delta = torch.zeros_like(last_delta)
         graph_representation = torch.cat([last, mean, last_delta], dim=-1)
         logits = self.classifier(graph_representation)
         intensity, beta, mu = self.influence.candidate_intensity(
@@ -844,7 +879,14 @@ class HawkesDYGNN(nn.Module):
         normalized_log_intensity = log_intensity - torch.logsumexp(
             log_intensity, dim=-1, keepdim=True
         )
-        logits = logits + intensity_scale * normalized_log_intensity
+        if not self.ablate_edge_change:
+            # The candidate intensity is an explicit, structured description of
+            # process transition strength: ``mu + sum_j alpha[a_j, c] *
+            # kernel(gap_j)``.  Leaving it in the logits would hand the model
+            # the pair structure and the temporal decay through a second path
+            # even after the edge has been blinded, so the full change ablation
+            # keeps it out of the prediction.  It is still computed for aux.
+            logits = logits + intensity_scale * normalized_log_intensity
         if return_aux:
             alpha, _, _ = self.influence.positive_parameters()
             if self.graph_layers:
